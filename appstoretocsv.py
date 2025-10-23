@@ -1,222 +1,199 @@
-# Streamlit App: Сбор отзывов App Store (RU)
-# Полностью готовый к запуску в Colab/Streamlit
 
-# Установка необходимых пакетов (раскомментируйте при запуске в Colab)
-# !pip install streamlit requests beautifulsoup4 lxml pandas tqdm
+```python
+# app_store_reviews_streamlit.py
 
 import streamlit as st
-import requests
-from bs4 import BeautifulSoup
+import requests, time, random, re, os, logging
 import pandas as pd
-from tqdm import tqdm
-import time
-import random
-import logging
+from bs4 import BeautifulSoup
 from datetime import datetime
+from retrying import retry
+from dateutil import parser as dateutil_parser
 
-# ----------------------------
 # Логирование
-# ----------------------------
-def setup_logger(app_id):
-    log_filename = f"app_{app_id}_reviews_error.log"
-    logger = logging.getLogger(app_id)
-    logger.setLevel(logging.INFO)
-    handler = logging.FileHandler(log_filename, mode='w', encoding='utf-8')
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-    logger.addHandler(handler)
-    return logger, log_filename
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app_reviews_scraper")
 
-# ----------------------------
-# Функция для сохранения CSV
-# ----------------------------
-def save_csv(df, filename):
-    df.to_csv(filename, index=False, encoding='utf-8-sig')
+# User Agents для запросов
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+]
 
-# ----------------------------
-# Нормализация отдельного отзыва
-# ----------------------------
-def normalize_review(raw, app_id, app_name):
-    review = {
-        "review_id": raw.get("id") or raw.get("reviewId") or None,
-        "app_id": app_id,
-        "app_name": app_name,
-        "country": "ru",
-        "user_name": raw.get("userName") or raw.get("author", {}).get("name") or None,
-        "rating": raw.get("rating") or raw.get("averageUserRating") or None,
-        "title": raw.get("title") or raw.get("summary") or "",
-        "text": raw.get("content") or raw.get("review") or "",
-        "version": raw.get("version") or raw.get("appVersion") or None,
-        "date": raw.get("date") or raw.get("updated") or None,
-        "helpful_count": raw.get("voteCount") or 0,
-        "raw_source_url": raw.get("link") or None
+def _get_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/html, */*;q=0.1",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-    # Приведение даты к ISO 8601
-    if review["date"]:
-        try:
-            review["date"] = pd.to_datetime(review["date"]).isoformat()
-        except:
-            review["date"] = None
-    return review
 
-# ----------------------------
-# Получение отзывов через API/JSON
-# ----------------------------
-def fetch_reviews_api(app_id, limit=1000, logger=None):
-    reviews = []
-    page = 1
-    per_page = 50  # Apple RSS/JSON обычно возвращает 50 за раз
-    app_name = None
+def _random_sleep():
+    time.sleep(random.uniform(0.5, 1.5))
 
-    while len(reviews) < limit:
-        url = f"https://itunes.apple.com/rss/customerreviews/page={page}/id={app_id}/sortby=mostrecent/json"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        success = False
-        for attempt in range(3):
-            try:
-                resp = requests.get(url, headers=headers, timeout=10)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    entries = data.get("feed", {}).get("entry", [])
-                    if page == 1 and entries:
-                        app_name = entries[0].get("im:name", {}).get("label")
-                        entries = entries[1:]  # первый элемент — информация о приложении
-                    if not entries:
-                        return reviews
-                    for e in entries:
-                        reviews.append(normalize_review(e, app_id, app_name))
-                    success = True
-                    break
-                else:
-                    time.sleep(random.uniform(0.5, 1.5))
-            except Exception as ex:
-                if logger:
-                    logger.error(f"API fetch attempt {attempt+1} failed: {ex}")
-                time.sleep(random.uniform(0.5, 1.5))
-        if not success:
-            if logger:
-                logger.error("API fetch failed, остановка сборa.")
-            break
-        page += 1
-    return reviews[:limit]
+def _is_captcha_or_block(resp):
+    if resp is None:
+        return False
+    if resp.status_code in (403, 429):
+        return True
+    text = getattr(resp, "text", "").lower()
+    triggers = ["captcha", "заблокирован", "access denied", "not allowed", "отказано", "verify you are human"]
+    return any(t in text for t in triggers)
 
-# ----------------------------
-# Получение отзывов через веб-скрейпинг
-# ----------------------------
-def fetch_reviews_scrape(app_id, limit=1000, logger=None):
-    reviews = []
-    page = 1
-    app_name = None
-    seen_ids = set()
-
-    while len(reviews) < limit:
-        url = f"https://apps.apple.com/ru/app/id{app_id}?see-all=reviews&page={page}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        success = False
-        for attempt in range(3):
-            try:
-                resp = requests.get(url, headers=headers, timeout=10)
-                if resp.status_code == 200:
-                    soup = BeautifulSoup(resp.text, "lxml")
-                    if page == 1:
-                        title_tag = soup.find("h1", {"class": "app-header__title"})
-                        app_name = title_tag.text.strip() if title_tag else None
-                    review_blocks = soup.find_all("div", {"class": "we-customer-review"})
-                    if not review_blocks:
-                        return reviews
-                    for block in review_blocks:
-                        review = {}
-                        review["reviewId"] = block.get("id")
-                        review["userName"] = block.find("span", {"class": "we-truncate we-truncate--single-line"}).text.strip() if block.find("span", {"class": "we-truncate we-truncate--single-line"}) else None
-                        review["title"] = block.find("h3").text.strip() if block.find("h3") else ""
-                        review["content"] = block.find("blockquote").text.strip() if block.find("blockquote") else ""
-                        review["rating"] = int(block.find("span", {"class": "we-star-rating"})["aria-label"].split()[0]) if block.find("span", {"class": "we-star-rating"}) else None
-                        review["version"] = block.find("span", {"class": "we-customer-review__version"}).text.strip() if block.find("span", {"class": "we-customer-review__version"}) else None
-                        review["date"] = block.find("time")["datetime"] if block.find("time") else None
-                        review["voteCount"] = int(block.find("span", {"class": "we-customer-review__helpful-count"}).text.strip().split()[0]) if block.find("span", {"class": "we-customer-review__helpful-count"}) else 0
-                        review["link"] = url
-                        normalized = normalize_review(review, app_id, app_name)
-                        # Дедупликация
-                        unique_key = normalized["review_id"] or (normalized["user_name"], normalized["date"], normalized["text"][:120])
-                        if unique_key in seen_ids:
-                            continue
-                        seen_ids.add(unique_key)
-                        reviews.append(normalized)
-                    success = True
-                    break
-                elif resp.status_code == 429:
-                    if logger:
-                        logger.error("Обнаружена блокировка/CAPTCHA, остановка.")
-                    return reviews
-                else:
-                    time.sleep(random.uniform(0.5, 1.5))
-            except Exception as ex:
-                if logger:
-                    logger.error(f"Scrape attempt {attempt+1} failed: {ex}")
-                time.sleep(random.uniform(0.5, 1.5))
-        if not success:
-            if logger:
-                logger.error("Scrape failed, остановка.")
-            break
-        page += 1
-    return reviews[:limit]
-
-# ----------------------------
-# Streamlit интерфейс
-# ----------------------------
-st.set_page_config(page_title="App Store Reviews Collector", layout="wide")
-st.title("Сбор отзывов App Store (RU)")
-
-st.markdown("""
-**Инструкция:**
-1. Вставьте App ID приложения.
-2. Нажмите кнопку «Собрать отзывы».
-3. После завершения сборa можно скачать CSV.
-""")
-
-app_id_input = st.text_input("Введите App ID (например, 1234567890)")
-
-if st.button("Собрать отзывы") and app_id_input:
-    logger, log_file = setup_logger(app_id_input)
-    st.info("Начинаем сбор отзывов...")
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
-
-    reviews = []
-
-    # Сначала пробуем API
+def _safe_get(url, params=None, headers=None, allow_redirects=True, timeout=15):
+    headers = headers or _get_headers()
     try:
-        api_reviews = fetch_reviews_api(app_id_input, limit=1000, logger=logger)
-        reviews.extend(api_reviews)
-        progress_text.text(f"Собрано через API: {len(reviews)} отзывов")
-        progress_bar.progress(min(len(reviews)/1000, 1.0))
-    except Exception as e:
-        logger.error(f"Ошибка API: {e}")
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=allow_redirects)
+        return resp
+    except requests.RequestException as e:
+        logger.warning("Network error for %s: %s", url, e)
+        return None
 
-    # Если мало отзывов, дополняем скрейпингом
-    if len(reviews) < 1000:
+def fetch_reviews_api(app_id, limit=200):
+    collected = []
+    per_page = 200
+    page = 1
+    base_url = f"https://itunes.apple.com/rss/customerreviews/id={app_id}/json"
+
+    while len(collected) < limit:
+        params = {"cc":"ru", "l":"ru","sortBy":"mostRecent","limit":per_page,"page":page}
+        resp = _safe_get(base_url, params=params)
+        if resp is None or _is_captcha_or_block(resp):
+            raise RuntimeError("CAPTCHA_OR_BLOCK")
         try:
-            scrape_reviews = fetch_reviews_scrape(app_id_input, limit=1000 - len(reviews), logger=logger)
-            reviews.extend(scrape_reviews)
-            progress_text.text(f"Всего собрано: {len(reviews)} отзывов")
-            progress_bar.progress(min(len(reviews)/1000, 1.0))
-        except Exception as e:
-            logger.error(f"Ошибка скрейпинга: {e}")
+            data = resp.json()
+        except:
+            break
+        feed = data.get("feed", {})
+        entries = feed.get("entry", [])
+        new_count = 0
+        for ent in entries:
+            if "im:rating" not in ent:
+                continue
+            collected.append(ent)
+            new_count += 1
+            if len(collected) >= limit:
+                break
+        if new_count == 0:
+            break
+        page += 1
+        _random_sleep()
+    return collected[:limit]
 
-    if reviews:
-        df = pd.DataFrame(reviews)
-        csv_filename = f"app_{app_id_input}_reviews.csv"
-        save_csv(df, csv_filename)
-        st.success(f"Сбор завершен! Всего отзывов: {len(df)}")
-        st.dataframe(df.head(10))
-        st.download_button(
-            label="Скачать CSV",
-            data=df.to_csv(index=False, encoding='utf-8-sig'),
-            file_name=csv_filename,
-            mime="text/csv"
-        )
-    else:
-        st.warning("Отзывы не были собраны. Проверьте App ID или наличие блокировок.")
-        st.write(f"Смотрите лог: {log_file}")
+def fetch_reviews_scrape(app_id, limit=200):
+    collected = []
+    base_url = f"https://apps.apple.com/ru/app/id{app_id}"
+    resp = _safe_get(base_url)
+    if resp is None or _is_captcha_or_block(resp):
+        raise RuntimeError("CAPTCHA_OR_BLOCK")
+    soup = BeautifulSoup(resp.text, "lxml")
+    review_nodes = soup.find_all(lambda tag: (tag.name=="div" and tag.get("role")=="article") or (tag.name=="div" and tag.get("class") and any("we-customer-review" in c for c in tag.get("class"))))
+    for node in review_nodes:
+        if len(collected) >= limit:
+            break
+        try:
+            raw = {}
+            review_id = node.get("data-review-id") or (node.find(attrs={"data-review-id": True}) or {}).get("data-review-id")
+            title = (node.find(["h3","h4"]) or {}).get_text(strip=True) if node.find(["h3","h4"]) else ""
+            body_tag = node.find("blockquote") or node.find("p")
+            body = body_tag.get_text(" ",strip=True) if body_tag else node.get_text(" ",strip=True)
+            rating_tag = node.find(lambda tag: tag.name in ("span","i") and tag.get("aria-label") and re.search(r"\d", tag.get("aria-label")))
+            rating = int(re.search(r"(\d)", rating_tag.get("aria-label")).group(1)) if rating_tag else None
+            user_tag = node.find(lambda tag: tag.name in ("span","h4","div") and tag.get("class") and any("user" in c for c in " ".join(tag.get("class"))))
+            user_name = user_tag.get_text(strip=True) if user_tag else ""
+            date_tag = node.find("time")
+            date = date_tag["datetime"] if date_tag and date_tag.has_attr("datetime") else None
+            raw.update({"id":{"label":review_id},"title":{"label":title},"content":{"label":body},"author":{"name":{"label":user_name}},"rating":{"label":rating},"updated":{"label":date}})
+            collected.append(raw)
+        except:
+            continue
+    return collected[:limit]
+
+def _parse_date_to_iso(date_raw):
+    if not date_raw: return None
+    try: return dateutil_parser.parse(str(date_raw), fuzzy=True).isoformat()
+    except: return None
+
+def normalize_review(raw, app_id=None):
+    try:
+        review_id = raw.get("id",{}).get("label")
+        user_name = raw.get("author",{}).get("name",{}).get("label") or ""
+        rating = int(raw.get("rating",{}).get("label") or 0)
+        title = raw.get("title",{}).get("label") or ""
+        text = raw.get("content",{}).get("label") or ""
+        version = raw.get("im:version",{}).get("label") if raw.get("im:version") else ""
+        date_iso = _parse_date_to_iso(raw.get("updated",{}).get("label"))
+        return {
+            "review_id": str(review_id),
+            "app_id": str(app_id),
+            "app_name": "",
+            "country": "ru",
+            "user_name": user_name,
+            "rating": rating,
+            "title": title,
+            "text": text,
+            "version": version,
+            "date": date_iso,
+            "helpful_count": None,
+            "raw_source_url": review_id or ""
+        }
+    except:
+        return None
+
+def save_csv(df, filename):
+    df.to_csv(filename,index=False,encoding="utf-8-sig")
+
+def collect_reviews(app_id, max_reviews=1000):
+    collected_raw=[]
+    error_flag=False
+    try:
+        collected_raw.extend(fetch_reviews_api(app_id, max_reviews))
+    except RuntimeError:
+        error_flag=True
+    except:
+        pass
+    if not error_flag and len(collected_raw)<max_reviews:
+        try:
+            need = max_reviews - len(collected_raw)
+            collected_raw.extend(fetch_reviews_scrape(app_id, need))
+        except RuntimeError:
+            error_flag=True
+    normalized=[]
+    seen_ids=set()
+    for raw in collected_raw:
+        norm = normalize_review(raw, app_id)
+        if not norm: continue
+        rid = norm.get("review_id")
+        if rid in seen_ids: continue
+        seen_ids.add(rid)
+        normalized.append(norm)
+        if len(normalized)>=max_reviews: break
+    df=pd.DataFrame(normalized,columns=["review_id","app_id","app_name","country","user_name","rating","title","text","version","date","helpful_count","raw_source_url"])
+    csv_file=f"app_{app_id}_reviews.csv"
+    log_file=f"app_{app_id}_reviews_error.log"
+    save_csv(df,csv_file)
+    if error_flag:
+        with open(log_file,"w",encoding="utf-8") as f:
+            f.write(f"[{datetime.utcnow().isoformat()}] CAPTCHA/block detected. Collected: {len(df)} reviews\n")
+    return df,error_flag,csv_file,log_file
+
+# --- Streamlit UI ---
+st.title("Сбор отзывов из российского App Store")
+
+st.write("Введите идентификатор приложения (APP_ID) из App Store и нажмите кнопку 'Собрать отзывы'.")
+
+app_id_input = st.text_input("APP_ID", "")
+
+max_reviews = st.slider("Максимум отзывов", min_value=100, max_value=1000, value=1000, step=50)
+
+if st.button("Собрать отзывы") and app_id_input.strip():
+    with st.spinner("Сбор отзывов..."):
+        try:
+            df, blocked, csv_file, log_file = collect_reviews(app_id_input.strip(), max_reviews=max_reviews)
+            st.success(f"Сбор завершён. Всего уникальных отзывов: {len(df)}")
+            st.dataframe(df.head(10))
+            st.download_button("Скачать CSV", df.to_csv(index=False).encode("utf-8-sig"), file_name=csv_file)
+            if blocked:
+                st.warning(f"Сбор остановлен из-за CAPTCHA/блокировки. Сохранён лог: {log_file}")
+        except Exception as e:
+            st.error(f"Произошла ошибка: {e}")
