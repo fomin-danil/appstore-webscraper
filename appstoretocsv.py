@@ -1,110 +1,103 @@
-# app.py
 import streamlit as st
 import requests
-import pandas as pd
-import random
+import csv
 import time
-from dateutil import parser as dateparser
+import datetime
+import pandas as pd
 
-st.title("App Store Reviews Collector")
+# ----------------------------
+# Настройки приложения
+# ----------------------------
+st.title("Google Play Reviews Scraper")
+st.write("Сбор отзывов по ID приложения из Google Play без API")
 
-# Ввод параметров
-APP_ID = st.text_input("Введите App Store ID (например 1234567890):")
-MAX_REVIEWS = st.number_input("Максимум отзывов", min_value=10, max_value=1000, value=1000)
-START_BTN = st.button("Собрать отзывы")
+app_id = st.text_input("Введите applicationId (например: com.whatsapp):")
+country = st.text_input("Страна (код, например ru, us, de):", "ru")
+max_pages = st.number_input("Макс. страниц", min_value=1, max_value=100, value=10)
+delay = st.number_input("Пауза между запросами (сек)", min_value=0.5, max_value=10.0, value=3.0)
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/118.0",
-]
+start_btn = st.button("🚀 Начать сбор отзывов")
 
-BASE_URL = "https://itunes.apple.com/ru/rss/customerreviews/id={}/json?page={}"
+progress = st.empty()
+log_area = st.empty()
 
-# Функция для безопасного запроса
-def fetch_page(app_id, page):
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
-    time.sleep(random.uniform(0.5, 1.5))
-    try:
-        resp = requests.get(BASE_URL.format(app_id, page), headers=headers, timeout=15)
-        if resp.status_code != 200 or "captcha" in resp.text.lower() or "<html" in resp.text.lower():
-            return None, True
-        data = resp.json()
-        return data, False
-    except:
-        return None, False
+def fetch_reviews(app_id, country, max_pages, delay):
+    collected = []
+    base_url = "https://play.google.com/store/getreviews"
 
-# Нормализация отзыва
-def normalize_review(raw):
-    rid = raw.get("id", {}).get("label")
-    author = raw.get("author", {}).get("name", {}).get("label","")
-    rating = raw.get("im:rating", {}).get("label","")
-    title = raw.get("title", {}).get("label","")
-    text = raw.get("content", {}).get("label","")
-    version = raw.get("im:version", {}).get("label","")
-    date_raw = raw.get("updated", {}).get("label","")
-    date_iso = ""
-    try:
-        if date_raw:
-            date_iso = dateparser.parse(date_raw).isoformat()
-    except:
-        date_iso = ""
-    url = raw.get("id", {}).get("label","")
-    return {
-        "review_id": rid,
-        "app_id": APP_ID,
-        "app_name": "",
-        "country": "ru",
-        "user_name": author,
-        "rating": rating,
-        "title": title,
-        "text": text,
-        "version": version,
-        "date": date_iso,
-        "helpful_count": None,
-        "raw_source_url": url
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0 Safari/537.36"
     }
 
-# Основная функция сбора
-def collect_reviews(app_id, max_reviews):
-    collected = []
-    page = 1
-    blocked = False
-    while len(collected) < max_reviews:
-        data, block = fetch_page(app_id, page)
-        if block:
-            blocked = True
-            break
-        if not data:
-            break
-        entries = data.get("feed", {}).get("entry", [])
-        if len(entries) <= 1:
-            break
-        for e in entries[1:]:  # первый элемент — мета
-            rid = e.get("id", {}).get("label")
-            if any(r["review_id"]==rid for r in collected):
-                continue
-            collected.append(normalize_review(e))
-            if len(collected) >= max_reviews:
-                break
-        page += 1
-    return collected, blocked
+    for page in range(max_pages):
+        progress.progress((page + 1) / max_pages)
 
-if START_BTN:
-    if not APP_ID:
-        st.warning("Введите App ID!")
+        data = {
+            "reviewType": 0,
+            "pageNum": page,
+            "id": app_id,
+            "reviewSortOrder": 0,
+            "xhr": 1,
+            "hl": country
+        }
+
+        resp = requests.post(base_url, data=data, headers=headers)
+
+        # Блок / CAPTCHA → остановка
+        if resp.status_code != 200 or "<HTML>" in resp.text.upper():
+            log_area.error("❌ Обнаружен блок или CAPTCHA, остановка")
+            break
+
+        try:
+            # Ответ содержит JSON в странном формате → вырезаем
+            json_text = resp.text.split("\n")[-1]
+            reviews = eval(json_text)[0][2]
+        except:
+            log_area.warning("⚠️ Не удалось разобрать JSON → остановка")
+            break
+
+        if not reviews:
+            log_area.info("✅ Отзывов больше нет, остановка")
+            break
+
+        for item in reviews:
+            collected.append({
+                "user": item[1],
+                "rating": item[2],
+                "date": item[5],
+                "comment": item[4],
+                "app_id": app_id,
+                "country": country
+            })
+
+        log_area.info(f"✅ Страница {page+1}: получено {len(reviews)} отзывов")
+
+        time.sleep(delay)
+
+    return collected
+
+
+if start_btn:
+    if not app_id:
+        st.error("Введите приложение!")
     else:
-        st.info("Сбор отзывов…")
-        reviews, blocked = collect_reviews(APP_ID, MAX_REVIEWS)
-        df = pd.DataFrame(reviews)
-        df.to_csv(f"app_{APP_ID}_reviews.csv", index=False, encoding="utf-8-sig")
-        st.success(f"Готово! Собрано {len(df)} отзывов. CSV сохранен как app_{APP_ID}_reviews.csv")
-        if blocked:
-            st.warning("Сбор остановлен из-за CAPTCHA/блокировки.")
-        st.dataframe(df.head(10))
-        st.download_button(
-            label="Скачать CSV",
-            data=df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"app_{APP_ID}_reviews.csv",
-            mime="text/csv"
-        )
+        log_area.info("⏳ Начинаю сбор...")
+        reviews = fetch_reviews(app_id, country, max_pages, delay)
+
+        if reviews:
+            df = pd.DataFrame(reviews)
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.success(f"🎉 Сбор завершён! Всего отзывов: {len(df)}")
+
+            st.download_button(
+                "⬇️ Скачать CSV",
+                csv,
+                f"{app_id}_reviews.csv",
+                "text/csv"
+            )
+
+            st.dataframe(df.head(20))
+        else:
+            st.error("❌ Не удалось собрать отзывы")
