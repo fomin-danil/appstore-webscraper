@@ -1,20 +1,16 @@
-
-```python
-# app_store_reviews_streamlit.py
+# appstoretocsv.py
 
 import streamlit as st
 import requests, time, random, re, os, logging
 import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime
-from retrying import retry
 from dateutil import parser as dateutil_parser
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app_reviews_scraper")
 
-# User Agents для запросов
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
@@ -179,11 +175,9 @@ def collect_reviews(app_id, max_reviews=1000):
 
 # --- Streamlit UI ---
 st.title("Сбор отзывов из российского App Store")
-
 st.write("Введите идентификатор приложения (APP_ID) из App Store и нажмите кнопку 'Собрать отзывы'.")
 
 app_id_input = st.text_input("APP_ID", "")
-
 max_reviews = st.slider("Максимум отзывов", min_value=100, max_value=1000, value=1000, step=50)
 
 if st.button("Собрать отзывы") and app_id_input.strip():
